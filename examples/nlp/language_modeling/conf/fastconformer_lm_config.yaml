@@ -1,0 +1,175 @@
+name: "FastConformer-LM"
+restore_from_path: null # used when starting from a .nemo file
+
+model:
+  encoder_seq_length: 12
+  max_position_embeddings: ${.encoder_seq_length}
+  make_vocab_size_divisible_by: 128 # Pad the vocab size to be divisible by this value for computation efficiency.
+  hidden_size: 768
+  tokenizer:
+    library: 'megatron'
+    type: 'GPT2BPETokenizer'
+    model: null
+    vocab_file: null
+    merge_file: null
+    delimiter: null # only used for tabular tokenizer
+    sentencepiece_legacy: False # Legacy=True allows you to add special tokens to sentencepiece tokenizers.
+
+  data:
+    # Path to data must be specified by the user.
+    # Supports List, String and Dictionary
+    # List : can override from the CLI: "model.data.data_prefix=[.5,/raid/data/pile/my-gpt3_00_text_document,.5,/raid/data/pile/my-gpt3_01_text_document]",
+    # Or see example below:
+    # data_prefix:
+    #   - .5
+    #   - /raid/data/pile/my-gpt3_00_text_document
+    #   - .5
+    #   - /raid/data/pile/my-gpt3_01_text_document
+    # Dictionary: can override from CLI "model.data.data_prefix"={"train":[1.0, /path/to/data], "validation":/path/to/data, "test":/path/to/test}
+    # Or see example below:
+    # "model.data.data_prefix: {train:[1.0,/path/to/data], validation:[/path/to/data], test:[/path/to/test]}"
+    data_prefix: ???
+    index_mapping_dir: null # path to save index mapping .npy files, by default will save in the same location as data_prefix
+    data_impl: mmap
+    splits_string: 900,50,50
+    seq_length: ${model.encoder_seq_length}
+    skip_warmup: True
+    num_workers: 2
+    dataloader_type: single # cyclic
+    reset_position_ids: False # Reset position ids after end-of-document token
+    reset_attention_mask: False # Reset attention mask after end-of-document token
+    eod_mask_loss: False # Mask loss for the end of document tokens
+    validation_drop_last: True # Set to false if the last partial validation samples is to be consumed
+    no_seqlen_plus_one_input_tokens: False # Set to True to disable fetching (sequence length + 1) input tokens, instead get (sequence length) input tokens and mask the last token
+    pad_samples_to_global_batch_size: False # Set to True if you want to pad the last partial batch with -1's to equal global batch size
+    shuffle_documents: True # Set to False to disable documents shuffling. Sample index will still be shuffled
+
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: 8 #${model.preprocessor.features}
+    feat_out: -1 # you may set it if you need different output size other than the default d_model
+    n_layers: 2 # 18
+    d_model: 10 #512
+
+    subsampling: null
+
+    # Feed forward module's params
+    ff_expansion_factor: 4
+
+    # Multi-headed Attention Module's params
+    self_attention_model: rel_pos # rel_pos or abs_pos
+    n_heads: 1 # 8 # may need to be lower for smaller d_models
+    # [left, right] specifies the number of steps to be seen from left and right of each step in self-attention
+    att_context_size: [-1, -1] # -1 means unlimited context
+    att_context_style: regular # regular or chunked_limited
+    xscaling: true # scales up the input embeddings by sqrt(d_model)
+    untie_biases: true # unties the biases of the TransformerXL layers
+    pos_emb_max_len: 5000
+
+    # Convolution module's params
+    conv_kernel_size: 9
+    conv_norm_type: 'batch_norm' # batch_norm or layer_norm or groupnormN (N specifies the number of groups)
+    # conv_context_size can be"causal" or a list of two integers while conv_context_size[0]+conv_context_size[1]+1==conv_kernel_size
+    # null means [(kernel_size-1)//2, (kernel_size-1)//2], and 'causal' means [(kernel_size-1), 0]
+    conv_context_size: null
+
+    ### regularization
+    dropout: 0.1 # The dropout used in most of the Conformer Modules
+    dropout_pre_encoder: 0 #0.1 # The dropout used before the encoder
+    dropout_emb: 0.0 # The dropout used for embeddings
+    dropout_att: 0.1 # The dropout for multi-headed attention modules
+
+    # set to non-zero to enable stochastic depth
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear  # linear or uniform
+    stochastic_depth_start_layer: 1
+
+  transf_decoder:
+    library: nemo
+    model_name: null
+    pretrained: false
+    max_sequence_length: ${model.encoder_seq_length}
+    num_token_types: 0
+    embedding_dropout: 0.1
+    learn_positional_encodings: false
+    hidden_size: 768
+    inner_size: 2048
+    num_layers: 6
+    num_attention_heads: 4
+    ffn_dropout: 0.1
+    attn_score_dropout: 0.1
+    attn_layer_dropout: 0.1
+    hidden_act: relu
+    pre_ln: true
+    pre_ln_final_layer_norm: true
+
+  head:
+    num_layers: 1
+    activation: relu
+    log_softmax: true
+    dropout: 0.0
+    use_transformer_init: true
+
+  optim:
+    name: adamw
+    lr: 1e-3
+    # optimizer arguments
+    betas: [0.9, 0.98]
+    # less necessity for weight_decay as we already have large augmentations with SpecAug
+    # you may need weight_decay for large models, stable AMP training, small datasets, or when lower augmentations are used
+    # weight decay of 0.0 with lr of 2.0 also works fine
+    weight_decay: 1e-3
+
+    # scheduler setup
+    sched:
+      name: CosineAnnealing
+      # scheduler config override
+      warmup_steps: 15000
+      warmup_ratio: null
+      min_lr: 1e-6
+
+trainer:
+  devices: -1 # number of GPUs, -1 would use all available GPUs
+  num_nodes: 1
+  max_epochs: 1000
+  max_steps: -1 # computed at runtime if not set
+  val_check_interval: 1.0 # Set to 0.25 to check 4 times per epoch, or an int for number of iterations
+  accelerator: auto
+  strategy: ddp
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.0
+  precision: 32 # Should be set to 16 for O1 and O2 to enable the AMP.
+  log_every_n_steps: 10  # Interval of logging.
+  enable_progress_bar: True
+  resume_from_checkpoint: null # The path to a checkpoint file to continue the training, restores the whole state including the epoch, step, LR schedulers, apex, etc.
+  num_sanity_val_steps: 0 # number of steps to perform validation steps for sanity check the validation process before starting the training, setting to 0 disables it
+  check_val_every_n_epoch: 1 # number of evaluations on validation every n epochs
+  sync_batchnorm: true
+  enable_checkpointing: False  # Provided by exp_manager
+  logger: false  # Provided by exp_manager
+  benchmark: false # needs to be false for models with variable-length speech input as it slows down training
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    # in case of multiple validation sets, first one is used
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: True # saves the checkpoints as nemo files instead of PTL checkpoints
+
+  # you need to set these two to True to continue the training
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false
+
+  # You may use this section to create a W&B logger
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null
+
+
+
