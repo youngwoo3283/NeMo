@@ -6,6 +6,7 @@ model:
   max_position_embeddings: ${.encoder_seq_length}
   make_vocab_size_divisible_by: 128 # Pad the vocab size to be divisible by this value for computation efficiency.
   hidden_size: 768
+  label_smoothing: 0.0
   tokenizer:
     library: 'megatron'
     type: 'GPT2BPETokenizer'
@@ -84,7 +85,7 @@ model:
     stochastic_depth_mode: linear  # linear or uniform
     stochastic_depth_start_layer: 1
 
-  transf_decoder:
+  transformer_decoder:
     library: nemo
     model_name: null
     pretrained: false
@@ -102,6 +103,7 @@ model:
     hidden_act: relu
     pre_ln: true
     pre_ln_final_layer_norm: true
+    vocab_size: -1 # will be filled during training
 
   head:
     num_layers: 1

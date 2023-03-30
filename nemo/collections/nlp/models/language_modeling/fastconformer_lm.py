@@ -12,18 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from hydra.utils import instantiate
+
 import os
-import string
-from dataclasses import dataclass
+from nemo.collections.common.losses import NLLLoss, SmoothedCrossEntropyLoss
+from nemo.collections.common.parts import transformer_weights_init
+from nemo.collections.common.metrics import GlobalAverageLossMetric
+from nemo.collections.nlp.modules.common import TokenClassifier
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 from hydra.utils import instantiate
-from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
+from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from nemo.utils import logging
-from nemo.collections.common.losses import NLLLoss, SmoothedCrossEntropyLoss
+from nemo.collections.common.losses import SmoothedCrossEntropyLoss
+from nemo.collections.nlp.modules.common.lm_utils import get_transformer
 from nemo.collections.nlp.modules.common.transformer.text_generation import (
     LengthParam,
     OutputType,
@@ -52,31 +55,20 @@ class FCModel(ModelPT, TextGeneration):
         self._build_tokenizer()
         # manipulate vocabulary (e.g., pad vocabulary for better efficiency)
         self._build_vocab()
-
-        import pdb;
-        pdb.set_trace()
-
         self.encoder = instantiate(self._cfg.encoder)
         self.wte = torch.nn.Embedding(self.padded_vocab_size, self._cfg.hidden_size)
         self.wpe = torch.nn.Embedding(self._cfg.max_position_embeddings, self._cfg.hidden_size)
-        self.drop = torch.nn.Dropout(0.1)
-        self.lm_head = nn.Linear(self._cfg.hidden_size, self.padded_vocab_size, bias=False)
 
         # Transformer decoder
-        vocab_size = 8 * ceil(self.tokenizer.vocab_size / 8)
-        transf_decoder_cfg_dict = OmegaConf.to_container(cfg.get('transf_decoder'))
-        transf_decoder_cfg_dict['vocab_size'] = vocab_size
-        library = transf_decoder_cfg_dict.pop('library', 'nemo')
-        model_name = transf_decoder_cfg_dict.pop('model_name', None)
-        pretrained = transf_decoder_cfg_dict.pop('pretrained', False)
-        checkpoint_file = transf_decoder_cfg_dict.pop('checkpoint_file', None)
-        self.transf_decoder = get_transformer(
-            library=library,
-            model_name=model_name,
-            pretrained=pretrained,
-            config_dict=transf_decoder_cfg_dict,
+        self._cfg.transformer_decoder.vocab_size = self.padded_vocab_size
+        self.transformer_decoder = get_transformer(
+            library=self._cfg.transformer_decoder.get("library", "nemo"),
+            model_name=self._cfg.transformer_decoder.get("model_name", None),
+            pretrained=self._cfg.transformer_decoder.get("pretrained", False),
+            checkpoint_file=self._cfg.transformer_decoder.get("checkpoint_file", None),
+            config_dict=self._cfg.transformer_decoder,
             encoder=False,
-            pre_ln_final_layer_norm=transf_decoder_cfg_dict.get("pre_ln_final_layer_norm", False),
+            pre_ln_final_layer_norm=self._cfg.transformer_decoder.get("pre_ln_final_layer_norm", False),
         )
 
         self.log_softmax = TokenClassifier(
@@ -87,23 +79,38 @@ class FCModel(ModelPT, TextGeneration):
             dropout=self._cfg.head.dropout,
             use_transformer_init=self._cfg.head.use_transformer_init,
         )
-        self.log_softmax.mlp.layer0.weight = self.transf_decoder.embedding.token_embedding.weight
-        std_init_range = 1 / self.transf_decoder.hidden_size ** 0.5
-        self.transf_decoder.apply(lambda module: transformer_weights_init(module, std_init_range))
+        self.log_softmax.mlp.layer0.weight = self.transformer_decoder.embedding.token_embedding.weight
+        std_init_range = 1 / self.transformer_decoder.hidden_size ** 0.5
+        self.transformer_decoder.apply(lambda module: transformer_weights_init(module, std_init_range))
         self.log_softmax.apply(lambda module: transformer_weights_init(module, std_init_range))
-
-        # Setup decoding objects
-        decoding_cfg = self.cfg.get('decoding', None)
-
-        # In case decoding config not found, use default config
-        if decoding_cfg is None:
-            decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
-            with open_dict(self.cfg):
-                self.cfg.decoding = decoding_cfg
-
-        self.decoding = CTCBPEDecoding(self.cfg.decoding, tokenizer=self.tokenizer)
-        self.loss = SmoothedCrossEntropyLoss(pad_id=self.tokenizer.pad_id, label_smoothing=self._cfg.label_smoothing)
+        self.loss = SmoothedCrossEntropyLoss(pad_id=self.tokenizer.pad_id if hasattr(self.tokenizer, "pad_id") else 0, label_smoothing=self._cfg.label_smoothing)
         self.val_loss = GlobalAverageLossMetric(dist_sync_on_step=False, take_avg_loss=True)
+
+    def setup(self, stage=None):
+        """ PTL hook that is executed after DDP spawns.
+            We setup datasets here as megatron datasets require DDP to instantiate.
+            See https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#setup for more information.
+        Args:
+            stage (str, optional): Can be 'fit', 'validate', 'test' or 'predict'. Defaults to None.
+        """
+        resume_checkpoint_path = self.trainer._checkpoint_connector.resume_from_checkpoint_fit_path
+        if resume_checkpoint_path:
+            init_consumed_samples = self._extract_consumed_samples_from_ckpt(resume_checkpoint_path)
+        else:
+            init_consumed_samples = 0
+        self.init_consumed_samples = init_consumed_samples
+        self.init_global_step = self.trainer.global_step
+
+        if stage == 'predict':
+            return
+        else:
+            # allowing restored models to optionally setup datasets
+            self.build_train_valid_test_datasets()
+            self.setup_training_data(self.cfg.data)
+            self.setup_validation_data(self.cfg.data)
+            self.setup_test_data(self.cfg.data)
+
+
 
     def _build_tokenizer(self):
         """
