@@ -240,11 +240,12 @@ class MegatronT5Model(MegatronLMEncoderDecoderModel):
             **self._build_train_valid_test_datasets_kwargs,
         )
 
-        logging.info("---->", self.tokenizer.ids_to_text(self._train_ds.datasets[0][60]["text_enc"]))
+        logging.info("\n\n---->", self.tokenizer.ids_to_text(self._train_ds.datasets[0][60]["text_enc"]))
         logging.info(f'Length of train dataset: {len(self._train_ds)}')
         logging.info(f'Length of val dataset: {len(self._validation_ds)}')
         logging.info(f'Length of test dataset: {len(self._test_ds)}')
         logging.info(f'Finished building {self.model_name} datasets.')
+        import pdb; pdb.set_trace()
         return self._train_ds, self._validation_ds, self._test_ds
 
     def list_available_models(self):

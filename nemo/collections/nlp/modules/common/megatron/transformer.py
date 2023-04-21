@@ -203,6 +203,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
             else:
                 self.input_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
+            print(f"Line 206: AttnType.self_attn: {AttnType.self_attn} -- self_attn_mask_type: {self_attn_mask_type}")
             self.self_attention = ParallelAttention(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
