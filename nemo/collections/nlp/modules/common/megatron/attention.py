@@ -38,6 +38,10 @@ except (ImportError, ModuleNotFoundError):
     # fake missing classes with None attributes
     ModelType = AttnMaskType = AttnType = LayerType = ApexGuardDefaults()
 
+try:
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+except ImportError:
+    flash_attn_unpadded_func = None
 
 try:
     from megatron.core import parallel_state, tensor_parallel
@@ -108,8 +112,25 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
 
         self.megatron_legacy = megatron_legacy
 
-        self.set_accepted_adapter_types([InfusedAdapterConfig._target_])
+        self.sequence_parallel = sequence_parallel
+        # TODO add parameter to control this
+        self.use_flash_attn = True #attention_type == AttnType.self_attn
 
+        if self.use_flash_attn:
+            if flash_attn_unpadded_func is None:
+                raise ImportError('FlashAttention is not installed, please install with '
+                                  'pip install flash-attn')
+            print(f"\n\nattention_type: {attention_type} ---> AttnType.self_attn: {AttnType.self_attn} ---> {attention_type == AttnType.self_attn}")
+            print(f"attn_mask_type: {attn_mask_type} ---> AttnMaskType.causal: {AttnMaskType.causal} ---> {attn_mask_type == AttnMaskType.causal}")
+            assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
+                                                          'self-attention for now')
+            assert self.attn_mask_type == AttnMaskType.causal, ('FlashAttention code path only '
+                                                                'supports causal mask for now')
+        else:
+            print("\n\n---->Not using FlashAttention\n\n")
+
+        self.set_accepted_adapter_types([InfusedAdapterConfig._target_])
+        import pdb; pdb.set_trace()
         if kv_channels is None:
             assert (
                 hidden_size % num_attention_heads == 0
@@ -181,6 +202,11 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             sequence_parallel=sequence_parallel,
             normalize_attention_scores=normalize_attention_scores,
         )
+
+        if self.use_flash_attn:
+            self.core_attention_flash = FlashSelfAttention(
+                causal=True, attention_dropout=attention_dropout
+            )
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
@@ -460,17 +486,28 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 headscale_tensor=self.head_scale_tensor if self.headscale else None,
             )
         else:
-            context_layer = self.core_attention(
-                query_layer,
-                key_layer,
-                value_layer,
-                attention_mask,
-                layer_past=layer_past,
-                get_key_value=get_key_value,
-                rotary_pos_emb=rotary_pos_emb,
-                relative_position_bias=relative_position_bias,
-                headscale_tensor=self.head_scale_tensor if self.headscale else None,
-            )
+            if self.use_flash_attn:
+                q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
+                       for x in (query_layer, key_layer, value_layer)]
+                if not self.sequence_parallel:
+                    with tensor_parallel.get_cuda_rng_tracker().fork():
+                        context_layer = self.core_attention_flash(q, k, v)
+                else:
+                    context_layer = self.core_attention_flash(q, k, v)
+                context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+                print("USING FLASH ATTN")
+            else:
+                context_layer = self.core_attention(
+                    query_layer,
+                    key_layer,
+                    value_layer,
+                    attention_mask,
+                    layer_past=layer_past,
+                    get_key_value=get_key_value,
+                    rotary_pos_emb=rotary_pos_emb,
+                    relative_position_bias=relative_position_bias,
+                    headscale_tensor=self.head_scale_tensor if self.headscale else None,
+                )
 
         # =================
         # Output. [sq, b, h]
@@ -644,6 +681,66 @@ class ParallelChunkedCrossAttention(MegatronModule):
         if not set_inference_key_value_memory and inference_max_sequence_len is not None:
             out = out[-1:]
         return out, bias
+
+class FlashSelfAttention(torch.nn.Module):
+    """Implement the scaled dot product attention with softmax.
+    Arguments
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                      (default: 1/sqrt(d_keys) where d_keys is computed at
+                      runtime)
+        attention_dropout: The dropout rate to apply to the attention
+                           (default: 0.0)
+    """
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
+                 device=None, dtype=None):
+        super().__init__()
+        assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
+                                                      'e.g., with pip install flash-attn')
+        assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        self.dropout_p = attention_dropout
+
+    def forward(self, q, k, v):
+        """Implements the multihead softmax attention.
+        Arguments
+        ---------
+            q, k, v: The tensor containing the query, key, and value. (B, S, H, D)
+        """
+
+        assert all((i.dtype in [torch.float16, torch.bfloat16] for i in (q,k,v)))
+        assert all((i.is_cuda for i in (q,k,v)))
+
+        batch_size, seqlen_q = q.shape[0], q.shape[1]
+        seqlen_k = k.shape[1]
+
+        q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
+                                    device=q.device)
+
+        if self.training:
+            # during training q,k,v always have same seqlen
+            assert seqlen_k == seqlen_q
+
+            is_causal = self.causal
+            cu_seqlens_k = cu_seqlens_q
+        else:
+            # turn off FA causal mask after first inference autoregressive iteration
+            # only on first autoregressive step q,k,v have same seqlen
+            is_causal = seqlen_q == seqlen_k
+            cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
+                        device=q.device)
+            self.dropout_p = 0
+
+        output = flash_attn_unpadded_func(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+            self.dropout_p,
+            softmax_scale=self.softmax_scale, causal=is_causal
+        )
+
+        output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+        return output
 
 
 class CoreAttention(MegatronModule):
