@@ -303,7 +303,7 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
         self.log('unfied_accuracy', label_acc * 100)
         self.log('val_loss', avg_loss, prog_bar=True)
 
-        self.validation_step_outputs.clear() #free memory
+        self.validation_step_outputs.clear()  # free memory
         self.classification_report.reset()
 
     def predict(

@@ -122,7 +122,7 @@ class ModelPT(LightningModule, Model):
         self._optimizer_param_groups = None
         self._optimizer = None
         self._scheduler = None
-        #TODO: Add a list for validation_step_outputs and test_step_outputs to support multiple dataloaders 
+        # TODO: Add a list for validation_step_outputs and test_step_outputs to support multiple dataloaders
         # by retrieving if there are more than 1 dataloaders from trainer ??
         self.validation_step_outputs = []
         self.test_step_outputs = []
@@ -885,7 +885,7 @@ class ModelPT(LightningModule, Model):
             if output_dict is not None and 'log' in output_dict:
                 self.log_dict(output_dict.pop('log'), on_epoch=True)
 
-            self.validation_step_outputs.clear() # free memory
+            self.validation_step_outputs.clear()  # free memory
             return output_dict
 
         else:  # Case where we provide more than 1 data loader
@@ -944,7 +944,7 @@ class ModelPT(LightningModule, Model):
             if 'log' in output_dict:
                 self.log_dict(output_dict.pop('log'), on_epoch=True)
 
-            self.validation_step_outputs.clear() # free memory
+            self.validation_step_outputs.clear()  # free memory
             # return everything else
             return output_dict
 
@@ -980,7 +980,7 @@ class ModelPT(LightningModule, Model):
             if output_dict is not None and 'log' in output_dict:
                 self.log_dict(output_dict.pop('log'), on_epoch=True)
 
-            self.test_step_outputs.clear() # free memory
+            self.test_step_outputs.clear()  # free memory
             return output_dict
 
         else:  # Case where we provide more than 1 data loader
@@ -1037,7 +1037,7 @@ class ModelPT(LightningModule, Model):
             if 'log' in output_dict:
                 self.log_dict(output_dict.pop('log'), on_epoch=True)
 
-            self.test_step_outputs.clear() # free memory
+            self.test_step_outputs.clear()  # free memory
             # return everything else
             return output_dict
 
